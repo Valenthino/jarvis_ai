@@ -55,8 +55,8 @@ security:
 voice:
   provider: elevenlabs
   model: eleven_flash_v2_5
-  voice_name: "${JARVIS_VOICE_NAME:-Jarvis}"
-  voice_id: "${ELEVENLABS_VOICE_ID:-}"
+  voice_name: "${JARVIS_VOICE_NAME}"
+  voice_id: "${ELEVENLABS_VOICE_ID}"
   output_format: pcm_16000
 
 persona:
