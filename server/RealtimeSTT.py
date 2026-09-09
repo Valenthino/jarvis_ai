@@ -1,3 +1,4 @@
+
 """Small Linux/browser compatibility layer for the Jarvis server.
 
 The upstream server only uses RealtimeSTT's AudioToTextRecorder as a wrapper

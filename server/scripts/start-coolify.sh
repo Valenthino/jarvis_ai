@@ -29,4 +29,5 @@ text = os.path.expandvars(source.read_text(encoding="utf-8"))
 target.write_text(text, encoding="utf-8")
 PY
 
+
 exec "$VENV_PYTHON" "$APP_ROOT/server/server.py"
