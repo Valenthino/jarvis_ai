@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python311", "ffmpeg", "portaudio", "stdenv.cc.cc.lib"]
+
+[phases.install]
+cmds = ["python -m venv /opt/venv", "/opt/venv/bin/pip install --upgrade pip", "/opt/venv/bin/pip install -r requirements.txt"]
+
+[start]
+cmd = "bash server/scripts/start-coolify.sh"
+
+[variables]
+PYTHONUNBUFFERED = "1"

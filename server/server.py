@@ -39,7 +39,7 @@ from anthropic import Anthropic
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from RealtimeSTT import AudioToTextRecorder
+from faster_whisper import WhisperModel
 
 try:
     import psutil
@@ -47,7 +47,9 @@ except ImportError:  # machines panel degrades gracefully
     psutil = None
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config" / "server.yaml"
+CONFIG_PATH = Path(os.environ.get("JARVIS_CONFIG_PATH", str(ROOT / "config" / "server.yaml")))
+if not CONFIG_PATH.is_absolute():
+    CONFIG_PATH = ROOT / CONFIG_PATH
 LOG_PATH = ROOT / "logs" / "latency.jsonl"
 STATE_PATH = ROOT / "logs" / "hermes_sessions.json"
 USAGE_PATH = ROOT / "logs" / "usage_stats.json"
@@ -111,7 +113,36 @@ def load_env() -> None:
 
 
 def load_config() -> dict:
-    return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    # Support both ${VAR} and shell-style ${VAR:-default} references in
+    # deployment templates. Python's os.path.expandvars handles only the
+    # former, which would otherwise leave voice IDs and defaults unresolved.
+    env_ref = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:-|-)([^}]*))?\}")
+
+    def expand_string(value: str) -> str:
+        expanded = os.path.expandvars(value)
+
+        def replace(match: re.Match) -> str:
+            name, operator, default = match.groups()
+            current = os.environ.get(name)
+            if current is not None and (current != "" or operator != ":-"):
+                return current
+            if operator:
+                return default or ""
+            return match.group(0)
+
+        return env_ref.sub(replace, expanded)
+
+    def expand(value):
+        if isinstance(value, dict):
+            return {key: expand(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [expand(item) for item in value]
+        if isinstance(value, str):
+            return expand_string(value)
+        return value
+
+    return expand(config)
 
 
 @dataclass
@@ -299,17 +330,10 @@ class VoicePipelineServer:
         self.turn_counter = 0
         self.hermes = HermesAPI(cfg)
         self.stt_lock = asyncio.Lock()
-        self.recorder = AudioToTextRecorder(
-            model=cfg["stt"]["model"],
-            use_microphone=False,
-            spinner=False,
+        self.recorder = WhisperModel(
+            cfg["stt"]["model"],
             device=cfg["stt"].get("device", "cpu"),
             compute_type=cfg["stt"].get("compute_type", "int8"),
-            sample_rate=int(cfg["stt"].get("sample_rate", 16000)),
-            language="en",
-            beam_size=1,
-            faster_whisper_vad_filter=False,
-            no_log_file=True,
         )
 
     def next_turn_id(self) -> int:
@@ -333,9 +357,16 @@ class VoicePipelineServer:
         samples = (np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0).copy()
         try:
             async with self.stt_lock:
-                self.recorder.feed_audio(samples, original_sample_rate=sample_rate)
-                text = await asyncio.to_thread(self.recorder.perform_final_transcription, samples, True)
-                self.recorder.clear_audio_queue()
+                def transcribe_sync() -> str:
+                    segments, _info = self.recorder.transcribe(
+                        samples,
+                        language="en",
+                        beam_size=1,
+                        vad_filter=False,
+                    )
+                    return " ".join(segment.text.strip() for segment in segments).strip()
+
+                text = await asyncio.to_thread(transcribe_sync)
         except Exception as exc:
             # near-silent audio can make whisper raise ("No clip timestamps found");
             # treat as empty transcript instead of failing the turn
@@ -440,10 +471,17 @@ class VoicePipelineServer:
         if not key:
             raise RuntimeError("ElevenLabs API key not found")
         timing.tts_model = voice["model"]
-        timing.voice_id = voice["voice_id"]
         timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
         record_usage(tts_chars=len(text))
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice['voice_id']}/stream"
+        requested_voice_id = (voice.get("voice_id") or "").strip()
+        fallback_voice_id = (voice.get("fallback_voice_id") or os.environ.get("ELEVENLABS_FALLBACK_VOICE_ID", "")).strip()
+        voice_ids = []
+        for voice_id in (requested_voice_id, fallback_voice_id):
+            if voice_id and voice_id not in voice_ids:
+                voice_ids.append(voice_id)
+        if not voice_ids:
+            raise RuntimeError("ElevenLabs voice ID not found")
+
         params = {"output_format": voice.get("output_format", "pcm_16000")}
         payload = {
             "text": text,
@@ -453,23 +491,40 @@ class VoicePipelineServer:
                 "style": 0.10, "use_speaker_boost": True,
             },
         }
-        response = requests.post(
-            url, params=params,
-            headers={"xi-api-key": key, "Accept": "application/octet-stream", "Content-Type": "application/json"},
-            json=payload, stream=True, timeout=120,
-        )
-        if response.status_code >= 400:
+        last_error = ""
+        for index, voice_id in enumerate(voice_ids):
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+            response = requests.post(
+                url, params=params,
+                headers={"xi-api-key": key, "Accept": "application/octet-stream", "Content-Type": "application/json"},
+                json=payload, stream=True, timeout=120,
+            )
+            if response.status_code < 400:
+                timing.voice_id = voice_id
+                try:
+                    for chunk in response.iter_content(chunk_size=4096):
+                        if not chunk:
+                            continue
+                        if timing.first_tts_audio_byte_monotonic is None:
+                            timing.first_tts_audio_byte_monotonic = time.perf_counter()
+                        yield chunk
+                finally:
+                    response.close()  # barge-in cancels mid-stream; don't leak the connection
+                return
+
+            error_body = response.text[:1000]
+            status = response.status_code
             response.close()
-            raise RuntimeError(f"ElevenLabs HTTP {response.status_code}: {response.text[:1000]}")
-        try:
-            for chunk in response.iter_content(chunk_size=4096):
-                if not chunk:
-                    continue
-                if timing.first_tts_audio_byte_monotonic is None:
-                    timing.first_tts_audio_byte_monotonic = time.perf_counter()
-                yield chunk
-        finally:
-            response.close()  # barge-in cancels mid-stream; don't leak the connection
+            last_error = f"ElevenLabs HTTP {status}: {error_body}"
+            marker = error_body.lower()
+            can_fallback = index + 1 < len(voice_ids) and status in (400, 404, 422) and any(
+                phrase in marker for phrase in ("free_users_not_allowed", "creator tier", "voice_not_found", "voice not found")
+            )
+            if can_fallback:
+                print(f"ElevenLabs voice {voice_id} unavailable; trying configured fallback voice.", flush=True)
+                continue
+            break
+        raise RuntimeError(last_error)
 
     # ------------------------------------------------------------- Turn flow
 
@@ -695,6 +750,12 @@ async def api_auth_middleware(request: Request, call_next):
     if request.url.path.startswith("/api/") and not _request_authed(request):
         return Response(status_code=401, content="jarvis auth required")
     return await call_next(request)
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    """Lightweight health endpoint for Coolify and reverse proxies."""
+    return JSONResponse({"status": "ok", "service": "jarvis-voice-hud"})
 
 
 def _ws_allowed(ws: WebSocket) -> bool:

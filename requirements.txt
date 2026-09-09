@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+requests
+pyyaml
+numpy
+anthropic
+faster-whisper
+websockets
+psutil
