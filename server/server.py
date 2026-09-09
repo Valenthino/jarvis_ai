@@ -239,9 +239,34 @@ class HermesAPI:
             return sid
         r = requests.post(f"{self.base}/api/sessions", headers=self.headers(),
                           json={"title": name}, timeout=15)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Coolify redeploys can remove Jarvis's local session-ID cache while
+            # Hermes keeps its durable session. Rebind by title instead of
+            # failing when Hermes correctly rejects a duplicate title.
+            try:
+                error = r.json()
+            except ValueError:
+                error = {}
+            message = str(error.get("error", {}).get("message", error.get("message", "")))
+            if r.status_code == 400 and ("already in use" in message or error.get("error", {}).get("code") == "invalid_title"):
+                existing = requests.get(
+                    f"{self.base}/api/sessions", headers=self.headers(),
+                    params={"limit": 100, "offset": 0}, timeout=15,
+                )
+                existing.raise_for_status()
+                rows = existing.json().get("data", [])
+                matches = [row for row in rows if row.get("title") == name and row.get("id")]
+                if matches:
+                    sid = max(matches, key=lambda row: row.get("last_active", row.get("started_at", 0))).get("id")
+                    state[name] = sid
+                    self._save_state(state)
+                    print(f"Reused Hermes session '{name}' -> {sid}", flush=True)
+                    return sid
+            r.raise_for_status()
         data = r.json()
         sid = (data.get("session") or data).get("id")
+        if not sid:
+            raise RuntimeError(f"Hermes session create returned no id: {r.text[:300]}")
         state[name] = sid
         self._save_state(state)
         print(f"Created Hermes session '{name}' -> {sid}", flush=True)
